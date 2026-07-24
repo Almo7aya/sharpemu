@@ -1324,6 +1324,111 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return num2 == importStubs.Count;
 	}
 
+	// IL2CPP's timezone bootstrap probes the localtime/UTC conversions for
+	// every minute across decades (~36M calls). Each managed dispatch costs
+	// microseconds, which turns that one-time table build into a multi-minute
+	// apparent freeze, so for a fixed-offset host zone (no DST rules) the
+	// conversion is emitted as native code instead. Zones with DST keep the
+	// managed HLE, which handles rule lookups.
+	private static readonly Lazy<int?> _fixedLocalTimeOffsetSeconds = new(static () =>
+	{
+		try
+		{
+			// Rule metadata alone over-rejects: zones with a single historic
+			// standard-offset change (e.g. an LMT transition decades before
+			// 1970) report adjustment rules despite never observing DST.
+			// Sample the era the probes actually cover instead: monthly from
+			// 1970 through 2100 — any DST zone flips within a year of samples.
+			var zone = TimeZoneInfo.Local;
+			var baseline = zone.GetUtcOffset(DateTimeOffset.UnixEpoch);
+			const long monthSeconds = 2_629_800;
+			const long endSeconds = 4_102_444_800; // 2100-01-01
+			for (long t = 0; t <= endSeconds; t += monthSeconds)
+			{
+				if (zone.GetUtcOffset(DateTimeOffset.FromUnixTimeSeconds(t)) != baseline)
+				{
+					return null;
+				}
+			}
+
+			return (int)baseline.TotalSeconds;
+		}
+		catch (Exception)
+		{
+			return null;
+		}
+	});
+
+	private static bool TryGetFixedLocalTimeOffsetSeconds(out int offsetSeconds)
+	{
+		var cached = _fixedLocalTimeOffsetSeconds.Value;
+		offsetSeconds = cached.GetValueOrDefault();
+		return cached.HasValue;
+	}
+
+	private static byte[]? TryBuildTimezoneIntrinsic(string nid)
+	{
+		if (nid is not ("0NTHN1NKONI" or "-o5uEDpN+oY") ||
+			!TryGetFixedLocalTimeOffsetSeconds(out var offsetSeconds))
+		{
+			return null;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][INFO] Native timezone conversion intrinsic enabled for {nid} " +
+			$"(fixed offset {offsetSeconds}s).");
+
+		if (nid == "-o5uEDpN+oY")
+		{
+			// sceKernelConvertUtcToLocaltime(utc=rdi, local*=rsi, timesec*=rdx, dstsec*=rcx)
+			var code = new byte[]
+			{
+				0x48, 0x85, 0xF6,                               //  0: test rsi,rsi
+				0x74, 0x2F,                                     //  3: jz einval
+				0x48, 0x8D, 0x87, 0x00, 0x00, 0x00, 0x00,       //  5: lea rax,[rdi+OFF]      (imm32 @8)
+				0x48, 0x89, 0x06,                               // 12: mov [rsi],rax
+				0x48, 0x85, 0xD2,                               // 15: test rdx,rdx
+				0x74, 0x11,                                     // 18: jz skip_timesec
+				0x48, 0x89, 0x3A,                               // 20: mov [rdx],rdi
+				0xC7, 0x42, 0x08, 0x00, 0x00, 0x00, 0x00,       // 23: mov dword[rdx+8],WEST  (imm32 @26)
+				0xC7, 0x42, 0x0C, 0x00, 0x00, 0x00, 0x00,       // 30: mov dword[rdx+12],0
+				0x48, 0x85, 0xC9,                               // 37: test rcx,rcx
+				0x74, 0x07,                                     // 40: jz skip_dst
+				0x48, 0xC7, 0x01, 0x00, 0x00, 0x00, 0x00,       // 42: mov qword[rcx],0
+				0x31, 0xC0,                                     // 49: xor eax,eax
+				0xC3,                                           // 51: ret
+				0xB8, 0x16, 0x00, 0x02, 0x80,                   // 52: mov eax,0x80020016 (EINVAL)
+				0xC3,                                           // 57: ret
+			};
+			BinaryPrimitives.WriteInt32LittleEndian(code.AsSpan(8), offsetSeconds);
+			BinaryPrimitives.WriteInt32LittleEndian(code.AsSpan(26), -offsetSeconds);
+			return code;
+		}
+
+		// sceKernelConvertLocaltimeToUtc(local=rdi, _, utc*=rdx, timezone*=rcx, dstsec*=r8)
+		var toUtc = new byte[]
+		{
+			0x48, 0x85, 0xC9,                                   //  0: test rcx,rcx
+			0x74, 0x2B,                                         //  3: jz einval
+			0xC7, 0x01, 0x00, 0x00, 0x00, 0x00,                 //  5: mov dword[rcx],MINWEST (imm32 @7)
+			0xC7, 0x41, 0x04, 0x00, 0x00, 0x00, 0x00,           // 11: mov dword[rcx+4],0
+			0x48, 0x85, 0xD2,                                   // 18: test rdx,rdx
+			0x74, 0x0A,                                         // 21: jz skip_utc
+			0x48, 0x8D, 0x87, 0x00, 0x00, 0x00, 0x00,           // 23: lea rax,[rdi-OFF]      (imm32 @26)
+			0x48, 0x89, 0x02,                                   // 30: mov [rdx],rax
+			0x4D, 0x85, 0xC0,                                   // 33: test r8,r8
+			0x74, 0x07,                                         // 36: jz skip_dst
+			0x41, 0xC7, 0x00, 0x00, 0x00, 0x00, 0x00,           // 38: mov dword[r8],0
+			0x31, 0xC0,                                         // 45: xor eax,eax
+			0xC3,                                               // 47: ret
+			0xB8, 0x16, 0x00, 0x02, 0x80,                       // 48: mov eax,0x80020016 (EINVAL)
+			0xC3,                                               // 53: ret
+		};
+		BinaryPrimitives.WriteInt32LittleEndian(toUtc.AsSpan(7), -offsetSeconds / 60);
+		BinaryPrimitives.WriteInt32LittleEndian(toUtc.AsSpan(26), -offsetSeconds);
+		return toUtc;
+	}
+
 	private unsafe bool TryCreateNativeImportIntrinsic(string nid, out nint address)
 	{
 		if (IsHlePreferredNid(nid))
@@ -1339,7 +1444,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return false;
 		}
 
-		ReadOnlySpan<byte> code = nid switch
+		var timezoneIntrinsic = TryBuildTimezoneIntrinsic(nid);
+		ReadOnlySpan<byte> code = timezoneIntrinsic is not null ? timezoneIntrinsic : nid switch
 		{
 			"-2IRUCO--PM" =>
 			[

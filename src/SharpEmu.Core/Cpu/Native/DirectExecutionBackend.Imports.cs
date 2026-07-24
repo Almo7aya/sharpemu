@@ -1424,7 +1424,12 @@ public sealed partial class DirectExecutionBackend
 			"xk0AcarP3V4" or // scePadOpen
 			"yH17Q6NWtVg" or // sceUserServiceGetEvent
 			"D-CzAxQL0XI" or // sceUserServiceGetPlatformPrivacySetting
-			"K-jXhbt2gn4";   // scePthreadMutexTrylock
+			"K-jXhbt2gn4" or // scePthreadMutexTrylock
+			// Pure arithmetic, and IL2CPP's timezone bootstrap probes them
+			// tens of millions of times in a tight loop; full dispatch
+			// overhead there reads as a multi-minute freeze during loading.
+			"0NTHN1NKONI" or // sceKernelConvertLocaltimeToUtc
+			"-o5uEDpN+oY";   // sceKernelConvertUtcToLocaltime
 
 	private bool ShouldLogImportResult(string nid, OrbisGen2Result result)
 	{

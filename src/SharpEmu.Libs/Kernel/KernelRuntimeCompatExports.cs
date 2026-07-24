@@ -1328,6 +1328,34 @@ public static class KernelRuntimeCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // The real kernel converts any time_t with plain arithmetic; Unity's
+    // timezone bootstrap probes these calls with arbitrary (even garbage)
+    // seconds, so the timezone-rule lookup must not throw on values outside
+    // DateTimeOffset's year 1..9999 window. The raw seconds arithmetic in the
+    // callers keeps the unclamped value; only the rule lookup saturates.
+    private static DateTimeOffset UnixSecondsToClampedDate(long seconds)
+    {
+        // One day inside DateTimeOffset's representable window, so applying a
+        // timezone offset to the clamped instant can never overflow either.
+        const long minUnixSeconds = -62135596800 + 86400;
+        const long maxUnixSeconds = 253402300799 - 86400;
+        return DateTimeOffset.FromUnixTimeSeconds(Math.Clamp(seconds, minUnixSeconds, maxUnixSeconds));
+    }
+
+    // IL2CPP builds its timezone transition table by probing the conversion
+    // exports for every hour across decades (tens of millions of calls), so
+    // this path must stay allocation-free: no ConvertTime/GetAdjustmentRules
+    // per call. The DST delta is the difference between the effective offset
+    // and the zone's standard offset, which matches what the rule scan
+    // computed while costing one lookup.
+    private static readonly TimeZoneInfo _localTimeZone = TimeZoneInfo.Local;
+
+    private static int GetDstSeconds(TimeSpan effectiveOffset)
+    {
+        var delta = effectiveOffset - _localTimeZone.BaseUtcOffset;
+        return delta > TimeSpan.Zero ? (int)delta.TotalSeconds : 0;
+    }
+
     [SysAbiExport(
         Nid = "-o5uEDpN+oY",
         ExportName = "sceKernelConvertUtcToLocaltime",
@@ -1345,18 +1373,13 @@ public static class KernelRuntimeCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var utc = DateTimeOffset.FromUnixTimeSeconds(utcSeconds);
-        var local = TimeZoneInfo.ConvertTime(utc, TimeZoneInfo.Local);
-        var offset = local.Offset;
+        var utc = UnixSecondsToClampedDate(utcSeconds);
+        var offset = _localTimeZone.GetUtcOffset(utc);
         var localSeconds = utcSeconds + (long)offset.TotalSeconds;
-        var dstSeconds = TimeZoneInfo.Local.IsDaylightSavingTime(local.DateTime)
-            ? (uint)Math.Max(0, TimeZoneInfo.Local.GetAdjustmentRules()
-                .Where(rule => rule.DateStart <= local.Date && rule.DateEnd >= local.Date)
-                .Select(rule => rule.DaylightDelta.TotalSeconds)
-                .DefaultIfEmpty(0)
-                .Max())
-            : 0u;
-        var westSeconds = unchecked((uint)(int)offset.TotalSeconds);
+        var dstSeconds = (uint)GetDstSeconds(offset);
+        // Seconds west of UTC excluding DST (FreeBSD timezone convention),
+        // consistent with sceKernelConvertLocaltimeToUtc's minuteswest.
+        var westSeconds = unchecked((uint)(int)-(offset.TotalSeconds - dstSeconds));
 
         if (!ctx.TryWriteUInt64(localTimeAddress, unchecked((ulong)localSeconds)))
         {
@@ -1401,17 +1424,13 @@ public static class KernelRuntimeCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var localDate = DateTimeOffset.FromUnixTimeSeconds(localSeconds).DateTime;
-        var offset = TimeZoneInfo.Local.GetUtcOffset(localDate);
+        var localDate = UnixSecondsToClampedDate(localSeconds).DateTime;
+        var offset = _localTimeZone.GetUtcOffset(localDate);
         var utcSeconds = localSeconds - (long)offset.TotalSeconds;
-        var dstSeconds = TimeZoneInfo.Local.IsDaylightSavingTime(localDate)
-            ? (int)Math.Max(0, TimeZoneInfo.Local.GetAdjustmentRules()
-                .Where(rule => rule.DateStart <= localDate.Date && rule.DateEnd >= localDate.Date)
-                .Select(rule => rule.DaylightDelta.TotalSeconds)
-                .DefaultIfEmpty(0)
-                .Max())
-            : 0;
-        var minutesWest = unchecked((int)-offset.TotalMinutes);
+        var dstSeconds = GetDstSeconds(offset);
+        // Minutes west of UTC excluding DST (FreeBSD timezone convention),
+        // consistent with sceKernelConvertUtcToLocaltime's west field.
+        var minutesWest = unchecked((int)-(offset.TotalSeconds - dstSeconds) / 60);
 
         if (!TryWriteInt32(ctx, timezoneAddress, minutesWest) ||
             !TryWriteInt32(ctx, timezoneAddress + sizeof(int), dstSeconds / 60))
