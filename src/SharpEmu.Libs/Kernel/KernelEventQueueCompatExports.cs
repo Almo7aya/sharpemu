@@ -17,6 +17,15 @@ public static class KernelEventQueueCompatExports
     public const short KernelEventFilterAmpr = -16;
     public const short KernelEventFilterAmprSystem = -17;
 
+    // Longest a timed sceKernelWaitEqueue parks before waking spuriously to
+    // return through its import boundary. A thread parked here is still marked
+    // Running, so it must reach that safe point promptly to deliver a queued
+    // IL2CPP stop-the-world suspend; otherwise the collector wedges waiting for
+    // an acknowledgement (seen as GfxFlipThread freezing during scene loads).
+    // The guest re-tests and re-waits, so an early return is harmless for the
+    // polling loops that use timed waits.
+    private const long HostEqueueWaitGraceMilliseconds = 50;
+
     private static readonly object _eventQueueGate = new();
     private static readonly HashSet<ulong> _eventQueues = new();
     private static readonly Dictionary<ulong, KernelEventDeque> _pendingEvents = new();
@@ -435,12 +444,19 @@ public static class KernelEventQueueCompatExports
             var timeoutMicros = timeoutRaw & 0xFFFF_FFFFUL;
             var deadline = Environment.TickCount64 +
                 Math.Max(1L, (long)Math.Min(timeoutMicros / 1000, int.MaxValue));
-            // Waits in bounded slices and delivers queued kernel exceptions
-            // (thread suspensions) between them, outside the gate: a thread
-            // parked here stays marked Running, so IL2CPP's stop-the-world
-            // collector otherwise waits for a suspension acknowledgement this
-            // thread can never produce (seen as GfxFlipThread wedging every
-            // collection during Unity scene loads).
+            // Park in short slices and, between them, pump the scheduler so a
+            // cooperative guest thread that will post the event still gets to
+            // run, and deliver any queued kernel exception (thread suspension)
+            // outside the gate: a thread parked here stays marked Running, so
+            // IL2CPP's stop-the-world collector otherwise waits for a
+            // suspension acknowledgement this thread can never produce (seen as
+            // GfxFlipThread wedging every collection during scene loads).
+            // Finally, give up early once the grace window elapses so the
+            // caller returns through its import boundary where the queued
+            // suspend is delivered; the guest re-tests and re-waits. This
+            // mirrors the host-parked pthread_cond_wait path.
+            var scheduler = GuestThreadExecution.Scheduler;
+            var spuriousWakeAt = Environment.TickCount64 + HostEqueueWaitGraceMilliseconds;
             while (true)
             {
                 lock (_eventQueueGate)
@@ -451,19 +467,22 @@ public static class KernelEventQueueCompatExports
                     }
 
                     var remaining = deadline - Environment.TickCount64;
-                    if (remaining <= 0)
+                    var graceRemaining = spuriousWakeAt - Environment.TickCount64;
+                    if (remaining <= 0 || graceRemaining <= 0)
                     {
                         break;
                     }
 
-                    Monitor.Wait(_eventQueueGate, (int)Math.Min(remaining, 100));
+                    var slice = Math.Min(Math.Min(remaining, graceRemaining), 100L);
+                    Monitor.Wait(_eventQueueGate, (int)Math.Max(1L, slice));
                     if (HasPendingEvents(handle) || deadline - Environment.TickCount64 <= 0)
                     {
                         break;
                     }
                 }
 
-                _ = (GuestThreadExecution.Scheduler as IGuestExceptionDeliveryScheduler)?
+                scheduler?.Pump(ctx, "sceKernelWaitEqueue");
+                _ = (scheduler as IGuestExceptionDeliveryScheduler)?
                     .TryDeliverPendingGuestExceptionForCurrentThread(ctx);
             }
 
