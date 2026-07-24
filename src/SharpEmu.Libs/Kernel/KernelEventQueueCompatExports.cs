@@ -12,6 +12,15 @@ namespace SharpEmu.Libs.Kernel;
 public static class KernelEventQueueCompatExports
 {
     private const int KernelEventSize = 0x20;
+    // Longest a timed sceKernelWaitEqueue host-parks before it wakes
+    // spuriously and returns through its import boundary. Cycling the present
+    // thread here instead of blocking the full flip-completion round-trip lets
+    // Blasphemous II hit the 60Hz flip rate it requests instead of settling at
+    // 30fps. WARNING: this is unstable -- the guest runs ahead of the GPU and
+    // the session hard-freezes after ~10s (see the experiment/blasphemous2-60fps
+    // branch notes). Kept for reference while a proper flip-completion latency
+    // fix is investigated.
+    private const long HostEqueueWaitGraceMilliseconds = 50;
     public const short KernelEventFilterGraphics = -14;
     public const short KernelEventFilterUser = -11;
     public const short KernelEventFilterAmpr = -16;
@@ -435,12 +444,16 @@ public static class KernelEventQueueCompatExports
             var timeoutMicros = timeoutRaw & 0xFFFF_FFFFUL;
             var deadline = Environment.TickCount64 +
                 Math.Max(1L, (long)Math.Min(timeoutMicros / 1000, int.MaxValue));
-            // Waits in bounded slices and delivers queued kernel exceptions
-            // (thread suspensions) between them, outside the gate: a thread
-            // parked here stays marked Running, so IL2CPP's stop-the-world
-            // collector otherwise waits for a suspension acknowledgement this
-            // thread can never produce (seen as GfxFlipThread wedging every
-            // collection during Unity scene loads).
+            // Waits in bounded slices, pumping the scheduler between them and
+            // giving up early (spuriously) once the grace window elapses. A
+            // thread parked here stays marked Running, so it must return
+            // through its import boundary promptly both to deliver a queued
+            // IL2CPP stop-the-world suspend (otherwise the collector wedges,
+            // seen as GfxFlipThread freezing during scene loads) and to let
+            // the present thread cycle at the requested 60Hz flip rate rather
+            // than blocking the full flip-completion round-trip down to 30fps.
+            var scheduler = GuestThreadExecution.Scheduler;
+            var spuriousWakeAt = Environment.TickCount64 + HostEqueueWaitGraceMilliseconds;
             while (true)
             {
                 lock (_eventQueueGate)
@@ -451,19 +464,22 @@ public static class KernelEventQueueCompatExports
                     }
 
                     var remaining = deadline - Environment.TickCount64;
-                    if (remaining <= 0)
+                    var graceRemaining = spuriousWakeAt - Environment.TickCount64;
+                    if (remaining <= 0 || graceRemaining <= 0)
                     {
                         break;
                     }
 
-                    Monitor.Wait(_eventQueueGate, (int)Math.Min(remaining, 100));
-                    if (HasPendingEvents(handle) || deadline - Environment.TickCount64 <= 0)
+                    var slice = Math.Min(Math.Min(remaining, graceRemaining), 100L);
+                    Monitor.Wait(_eventQueueGate, (int)Math.Max(1L, slice));
+                    if (HasPendingEvents(handle))
                     {
                         break;
                     }
                 }
 
-                _ = (GuestThreadExecution.Scheduler as IGuestExceptionDeliveryScheduler)?
+                scheduler?.Pump(ctx, "sceKernelWaitEqueue");
+                _ = (scheduler as IGuestExceptionDeliveryScheduler)?
                     .TryDeliverPendingGuestExceptionForCurrentThread(ctx);
             }
 
