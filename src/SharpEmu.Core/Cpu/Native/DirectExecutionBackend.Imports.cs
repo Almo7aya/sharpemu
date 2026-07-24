@@ -334,7 +334,12 @@ public sealed partial class DirectExecutionBackend
 		bool flag4 = !string.IsNullOrWhiteSpace(_importFilter);
 		bool flag5 = false;
 		ExportedFunction? matchedExport = importStubEntry.Export;
-		bool periodicTrace = num <= 128 ||
+		// The periodic import heartbeat is trace-level diagnostics; only emit it
+		// when the configured minimum level actually admits Trace. This keeps a
+		// default (Info) run quiet — run with --log-level trace to restore it.
+		bool periodicTrace =
+			SharpEmu.Logging.SharpEmuLog.MinimumLevel <= SharpEmu.Logging.LogLevel.Trace &&
+			(num <= 128 ||
 			(num >= 240 && num <= 400) ||
 			(num >= 900 && num <= 1300) ||
 			num % 100000 == 0L ||
@@ -342,7 +347,7 @@ public sealed partial class DirectExecutionBackend
 			(importStubEntry.Nid == "rTXw65xmLIA" && (num <= 256 || num % 128 == 0)) ||
 			flag ||
 			flag2 ||
-			flag3;
+			flag3);
 		if (matchedExport is not null)
 		{
 			if (flag4)
