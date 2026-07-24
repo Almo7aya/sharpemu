@@ -327,6 +327,20 @@ public static class KernelRuntimeCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    /// <summary>Microseconds since process start (sceKernelGetProcessTime units).</summary>
+    internal static ulong ProcessTimeMicroseconds()
+    {
+        var elapsedTicks = Stopwatch.GetTimestamp() - _processStartCounter;
+        var micros = elapsedTicks * 1_000_000L / Stopwatch.Frequency;
+        return unchecked((ulong)Math.Max(0, micros));
+    }
+
+    /// <summary>Counter ticks since process start (sceKernelGetProcessTimeCounter units).</summary>
+    internal static ulong ProcessTimeCounterTicks()
+    {
+        return unchecked((ulong)Math.Max(0, Stopwatch.GetTimestamp() - _processStartCounter));
+    }
+
     [SysAbiExport(
         Nid = "4J2sUJmuHZQ",
         ExportName = "sceKernelGetProcessTime",
@@ -334,9 +348,7 @@ public static class KernelRuntimeCompatExports
         LibraryName = "libKernel")]
     public static int KernelGetProcessTime(CpuContext ctx)
     {
-        var elapsedTicks = Stopwatch.GetTimestamp() - _processStartCounter;
-        var micros = elapsedTicks * 1_000_000L / Stopwatch.Frequency;
-        ctx[CpuRegister.Rax] = unchecked((ulong)Math.Max(0, micros));
+        ctx[CpuRegister.Rax] = ProcessTimeMicroseconds();
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -347,8 +359,7 @@ public static class KernelRuntimeCompatExports
         LibraryName = "libKernel")]
     public static int KernelGetProcessTimeCounter(CpuContext ctx)
     {
-        var elapsedTicks = Stopwatch.GetTimestamp() - _processStartCounter;
-        ctx[CpuRegister.Rax] = unchecked((ulong)Math.Max(0, elapsedTicks));
+        ctx[CpuRegister.Rax] = ProcessTimeCounterTicks();
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 

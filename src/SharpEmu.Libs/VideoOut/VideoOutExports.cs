@@ -23,6 +23,7 @@ public static class VideoOutExports
     private const int OrbisVideoOutErrorInvalidHandle = unchecked((int)0x8029000B);
     private const int OrbisVideoOutErrorInvalidEventQueue = unchecked((int)0x8029000C);
     private const int OrbisVideoOutErrorInvalidEvent = unchecked((int)0x8029000D);
+    private const int OrbisVideoOutErrorFlipQueueFull = unchecked((int)0x80290012);
     private const int OrbisVideoOutErrorUnsupportedOutputMode = unchecked((int)0x80290016);
     private const int OrbisVideoOutErrorInvalidOption = unchecked((int)0x8029001A);
     private const int SceVideoOutBusTypeMain = 0;
@@ -38,6 +39,8 @@ public static class VideoOutExports
     private const int VideoOutOutputOptionsSize = 0x40;
     private const int VideoOutOutputStatusSize = 0x30;
     private const int VideoOutVblankStatusSize = 0x28;
+    private const int VideoOutFlipStatusSize = 0x80;
+    private const int MaxPendingFlips = 16;
     private const ulong SceVideoOutOutputModeDefault = 1;
     private const ulong SceVideoOutOutputMode119_88Hz = 0xF;
     private const ulong SceVideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
@@ -198,7 +201,15 @@ public static class VideoOutExports
         public ulong VblankCount { get; set; }
         public ulong FlipCount { get; set; }
         public int CurrentBuffer { get; set; } = -1;
-        public ulong LastFlipArg { get; set; }
+        // SceVideoOutFlipStatus state. Hardware updates these when a flip
+        // completes (not at submit), and reports -1 before the first flip.
+        public long CompletedFlipArg { get; set; } = -1;
+        public int CompletedBuffer { get; set; } = -1;
+        public ulong CompletedProcessTime { get; set; }
+        public ulong CompletedProcessTimeCounter { get; set; }
+        public ulong SubmitProcessTimeCounter { get; set; }
+        public int PendingFlipCount { get; set; }
+        public int GcQueueCount { get; set; }
         public uint OutputWidth { get; set; } = 1920;
         public uint OutputHeight { get; set; } = 1080;
         public uint RefreshRate { get; set; } = 60;
@@ -562,11 +573,16 @@ public static class VideoOutExports
 
         var elapsedMicroseconds = unchecked((ulong)(Math.Max(now - openedAt, 0) *
             1_000_000L / Stopwatch.Frequency));
+        // SceVideoOutVblankStatus: count, processTime, tsc, processTimeCounter,
+        // flags, phase.
         Span<byte> status = stackalloc byte[VideoOutVblankStatusSize];
         status.Clear();
         BinaryPrimitives.WriteUInt64LittleEndian(status, count);
         BinaryPrimitives.WriteUInt64LittleEndian(status[0x08..], elapsedMicroseconds);
         BinaryPrimitives.WriteUInt64LittleEndian(status[0x10..], unchecked((ulong)now));
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            status[0x18..],
+            KernelRuntimeCompatExports.ProcessTimeCounterTicks());
         status[0x20] = 0;
         return ctx.Memory.TryWrite(statusAddress, status)
             ? (int)OrbisGen2Result.ORBIS_GEN2_OK
@@ -710,21 +726,44 @@ public static class VideoOutExports
         }
 
         ulong count;
-        uint currentBuffer;
-        ulong flipArg;
+        long flipArg;
+        int completedBuffer;
+        int pendingFlips;
+        int gcQueue;
+        ulong processTime;
+        ulong processTimeCounter;
+        ulong submitProcessTimeCounter;
         lock (_stateGate)
         {
             count = port.FlipCount;
-            currentBuffer = unchecked((uint)port.CurrentBuffer);
-            flipArg = port.LastFlipArg;
+            flipArg = port.CompletedFlipArg;
+            completedBuffer = port.CompletedBuffer;
+            pendingFlips = port.PendingFlipCount;
+            gcQueue = port.GcQueueCount;
+            processTime = port.CompletedProcessTime;
+            processTimeCounter = port.CompletedProcessTimeCounter;
+            submitProcessTimeCounter = port.SubmitProcessTimeCounter;
         }
 
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x00, count);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x08, 0);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x10, 0);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x18, flipArg);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x20, currentBuffer);
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        // SceVideoOutFlipStatus: count, processTime, reserved, flipArg,
+        // reserved, processTimeCounter, gcQueueNum, flipPendingNum,
+        // currentBuffer, reserved, submitProcessTimeCounter, reserved[7].
+        // The guest compares flipArg against the one it submitted; frame
+        // pacing stalls with every display buffer in flight when it never
+        // advances.
+        Span<byte> status = stackalloc byte[VideoOutFlipStatusSize];
+        status.Clear();
+        BinaryPrimitives.WriteUInt64LittleEndian(status, count);
+        BinaryPrimitives.WriteUInt64LittleEndian(status[0x08..], processTime);
+        BinaryPrimitives.WriteInt64LittleEndian(status[0x18..], flipArg);
+        BinaryPrimitives.WriteUInt64LittleEndian(status[0x28..], processTimeCounter);
+        BinaryPrimitives.WriteInt32LittleEndian(status[0x30..], gcQueue);
+        BinaryPrimitives.WriteInt32LittleEndian(status[0x34..], pendingFlips);
+        BinaryPrimitives.WriteInt32LittleEndian(status[0x38..], completedBuffer);
+        BinaryPrimitives.WriteUInt64LittleEndian(status[0x40..], submitProcessTimeCounter);
+        return ctx.Memory.TryWrite(statusAddress, status)
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
     }
 
     [SysAbiExport(
@@ -1160,9 +1199,21 @@ public static class VideoOutExports
                 return OrbisVideoOutErrorInvalidIndex;
             }
 
+            // Hardware bounds the flip queue; games poll for this error to
+            // pace submissions.
+            if (port.PendingFlipCount >= MaxPendingFlips)
+            {
+                return OrbisVideoOutErrorFlipQueueFull;
+            }
+
             port.CurrentBuffer = bufferIndex;
-            port.FlipCount++;
-            port.LastFlipArg = unchecked((ulong)flipArg);
+            port.PendingFlipCount++;
+            port.SubmitProcessTimeCounter = KernelRuntimeCompatExports.ProcessTimeCounterTicks();
+            if (!submitGpuImage)
+            {
+                port.GcQueueCount++;
+            }
+
             eventHint = SceVideoOutInternalEventFlip |
                 ((unchecked((ulong)flipArg) & 0x0000_FFFF_FFFF_FFFFUL) << 16);
             flipEventCount = port.FlipEvents.Count;
@@ -1195,8 +1246,24 @@ public static class VideoOutExports
             _ = TryDumpFrame(ctx, port, bufferIndex, flipMode, flipArg);
         }
 
-        void TriggerFlipEvents()
+        void CompleteFlip()
         {
+            // Hardware publishes the flip status when the flip completes;
+            // frame pacing polls sceVideoOutGetFlipStatus for this state.
+            lock (_stateGate)
+            {
+                port.FlipCount++;
+                port.CompletedFlipArg = flipArg;
+                port.CompletedBuffer = bufferIndex;
+                port.CompletedProcessTime = KernelRuntimeCompatExports.ProcessTimeMicroseconds();
+                port.CompletedProcessTimeCounter = KernelRuntimeCompatExports.ProcessTimeCounterTicks();
+                port.PendingFlipCount = Math.Max(0, port.PendingFlipCount - 1);
+                if (!submitGpuImage && port.GcQueueCount > 0)
+                {
+                    port.GcQueueCount--;
+                }
+            }
+
             if (flipEvents is null)
             {
                 return;
@@ -1223,14 +1290,14 @@ public static class VideoOutExports
 
         if (submitGpuImage)
         {
-            TriggerFlipEvents();
+            CompleteFlip();
         }
         else if (GuestGpu.Current.SubmitOrderedGuestAction(
-                     TriggerFlipEvents,
+                     CompleteFlip,
                      $"videoout flip complete handle={handle} index={bufferIndex}") == 0)
         {
             // Headless startup has no render queue to order against.
-            TriggerFlipEvents();
+            CompleteFlip();
         }
 
         TraceVideoOut(
