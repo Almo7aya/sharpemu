@@ -1620,6 +1620,12 @@ public static class KernelPthreadCompatExports
                     try
                     {
                         scheduler.Pump(ctx, timed ? "pthread_cond_timedwait" : "pthread_cond_wait");
+                        // A thread parked here never reaches the import-boundary
+                        // safe point, so queued kernel exceptions (IL2CPP's
+                        // stop-the-world suspension) must be delivered inline or
+                        // the collector waits on this thread forever.
+                        _ = (scheduler as IGuestExceptionDeliveryScheduler)?
+                            .TryDeliverPendingGuestExceptionForCurrentThread(ctx);
                     }
                     finally
                     {

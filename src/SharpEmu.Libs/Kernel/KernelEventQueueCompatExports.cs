@@ -435,10 +435,21 @@ public static class KernelEventQueueCompatExports
             var timeoutMicros = timeoutRaw & 0xFFFF_FFFFUL;
             var deadline = Environment.TickCount64 +
                 Math.Max(1L, (long)Math.Min(timeoutMicros / 1000, int.MaxValue));
-            lock (_eventQueueGate)
+            // Waits in bounded slices and delivers queued kernel exceptions
+            // (thread suspensions) between them, outside the gate: a thread
+            // parked here stays marked Running, so IL2CPP's stop-the-world
+            // collector otherwise waits for a suspension acknowledgement this
+            // thread can never produce (seen as GfxFlipThread wedging every
+            // collection during Unity scene loads).
+            while (true)
             {
-                while (!HasPendingEvents(handle))
+                lock (_eventQueueGate)
                 {
+                    if (HasPendingEvents(handle))
+                    {
+                        break;
+                    }
+
                     var remaining = deadline - Environment.TickCount64;
                     if (remaining <= 0)
                     {
@@ -446,7 +457,14 @@ public static class KernelEventQueueCompatExports
                     }
 
                     Monitor.Wait(_eventQueueGate, (int)Math.Min(remaining, 100));
+                    if (HasPendingEvents(handle) || deadline - Environment.TickCount64 <= 0)
+                    {
+                        break;
+                    }
                 }
+
+                _ = (GuestThreadExecution.Scheduler as IGuestExceptionDeliveryScheduler)?
+                    .TryDeliverPendingGuestExceptionForCurrentThread(ctx);
             }
 
             deliveredCount = DequeueEvents(ctx, handle, eventsAddress, eventCapacity);

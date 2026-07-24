@@ -313,6 +313,11 @@ public static class KernelEventFlagCompatExports
                         try
                         {
                             scheduler.Pump(ctx, "sceKernelWaitEventFlag");
+                            // A thread parked here stays marked Running, so a
+                            // queued suspension exception must be delivered
+                            // inline or the collector waits on it forever.
+                            _ = (scheduler as IGuestExceptionDeliveryScheduler)?
+                                .TryDeliverPendingGuestExceptionForCurrentThread(ctx);
                         }
                         finally
                         {
