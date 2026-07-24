@@ -16,7 +16,7 @@ using SharpEmu.HLE;
 
 namespace SharpEmu.Core.Cpu.Native;
 
-public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, IGuestThreadScheduler, IDisposable
+public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, IGuestThreadScheduler, IGuestExceptionDeliveryScheduler, IDisposable
 {
 	private static readonly SharpEmu.Logging.SharpEmuLogger Log = SharpEmu.Logging.SharpEmuLog.For("Native");
 
@@ -4932,6 +4932,74 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				_activeGuestExceptionDeliveries.Remove(threadHandle);
 			}
 		}
+	}
+
+	public bool TryDeliverPendingGuestExceptionForCurrentThread(CpuContext callerContext)
+	{
+		if (Volatile.Read(ref _pendingGuestExceptionCount) == 0)
+		{
+			return false;
+		}
+
+		var threadHandle = GuestThreadExecution.CurrentGuestThreadHandle;
+		if (threadHandle == 0)
+		{
+			threadHandle = _currentExternalGuestThreadHandle;
+		}
+
+		if (threadHandle == 0)
+		{
+			return false;
+		}
+
+		lock (_guestThreadGate)
+		{
+			// A delivery already running on this thread consumes queued
+			// follow-ups itself; delivering here would nest handlers.
+			if (!_pendingGuestExceptions.ContainsKey(threadHandle) ||
+				_activeGuestExceptionDeliveries.Contains(threadHandle))
+			{
+				return false;
+			}
+		}
+
+		// The caller is parked inside an HLE import handler, so the import
+		// call frame still describes the guest-side resume point; the other
+		// registers are live in the caller's context, matching what the
+		// import-boundary safe point captures.
+		GuestCpuContinuation continuation = default;
+		if (GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame) &&
+			frame.ReturnRip >= 65536)
+		{
+			continuation = new GuestCpuContinuation(
+				Rip: frame.ReturnRip,
+				Rsp: frame.ResumeRsp,
+				ReturnSlotAddress: frame.ReturnSlotAddress,
+				Rflags: callerContext.Rflags,
+				FsBase: callerContext.FsBase,
+				GsBase: callerContext.GsBase,
+				Rax: callerContext[CpuRegister.Rax],
+				Rcx: callerContext[CpuRegister.Rcx],
+				Rdx: callerContext[CpuRegister.Rdx],
+				Rbx: callerContext[CpuRegister.Rbx],
+				Rbp: callerContext[CpuRegister.Rbp],
+				Rsi: callerContext[CpuRegister.Rsi],
+				Rdi: callerContext[CpuRegister.Rdi],
+				R8: callerContext[CpuRegister.R8],
+				R9: callerContext[CpuRegister.R9],
+				R10: callerContext[CpuRegister.R10],
+				R11: callerContext[CpuRegister.R11],
+				R12: callerContext[CpuRegister.R12],
+				R13: callerContext[CpuRegister.R13],
+				R14: callerContext[CpuRegister.R14],
+				R15: callerContext[CpuRegister.R15],
+				FpuControlWord: callerContext.FpuControlWord,
+				Mxcsr: callerContext.Mxcsr,
+				RestoreFullFpuState: false);
+		}
+
+		DeliverPendingGuestExceptionAtSafePoint(callerContext, continuation);
+		return true;
 	}
 
 	private void QueuePendingGuestExceptionLocked(

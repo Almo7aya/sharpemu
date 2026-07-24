@@ -20,6 +20,10 @@ public static class KernelPthreadCompatExports
     private const int MutexObjectSize = 0x100;
     private const int MutexAttrObjectSize = 0x40;
     private const int CondObjectSize = 0x100;
+    // Bound on host-parked waits between checks for queued kernel exceptions
+    // (thread suspensions); also the worst-case suspension-ack latency for a
+    // thread parked in a host-side wait.
+    private static readonly TimeSpan HostParkExceptionPollInterval = TimeSpan.FromMilliseconds(10);
     private const int PthreadOnceUninitialized = 0;
     private const int PthreadOnceInProgress = 1;
     private const int PthreadOnceDone = 2;
@@ -1596,26 +1600,59 @@ public static class KernelPthreadCompatExports
 
         // Non-guest callers have no resumable CPU continuation. Park only
         // those host-side compatibility callers, preserving the same FIFO
-        // mutex reacquisition rules as cooperative guest waiters.
-        lock (state.SyncRoot)
+        // mutex reacquisition rules as cooperative guest waiters. The park
+        // uses bounded slices with kernel-exception delivery between them:
+        // IL2CPP's stop-the-world collector raises its suspend exception at
+        // this thread and waits for the handler's acknowledgement, and a
+        // thread parked here never reaches the import-boundary safe point
+        // that normally runs queued handlers. Delivery happens outside the
+        // cond lock because the handler blocks on other primitives (it waits
+        // for the resume semaphore) and other threads must still be able to
+        // signal this cond meanwhile.
         {
             var deadline = timed
                 ? GuestThreadExecution.ComputeDeadlineTimestamp(GetCondWaitTimeout(timeoutUsec))
                 : long.MaxValue;
-            while (waiter.CompletionState == 0)
+            while (true)
             {
-                if (!timed)
+                lock (state.SyncRoot)
                 {
-                    Monitor.Wait(state.SyncRoot);
-                    continue;
+                    if (waiter.CompletionState != 0)
+                    {
+                        break;
+                    }
+
+                    var slice = HostParkExceptionPollInterval;
+                    if (timed)
+                    {
+                        var remaining = GetRemainingTimeout(deadline);
+                        if (remaining <= TimeSpan.Zero)
+                        {
+                            CompleteCondWaiterLocked(state, waiter, timedOut: true);
+                            break;
+                        }
+
+                        if (remaining < slice)
+                        {
+                            slice = remaining;
+                        }
+                    }
+
+                    _ = Monitor.Wait(state.SyncRoot, slice);
+                    if (waiter.CompletionState != 0)
+                    {
+                        break;
+                    }
+
+                    if (timed && GetRemainingTimeout(deadline) <= TimeSpan.Zero)
+                    {
+                        CompleteCondWaiterLocked(state, waiter, timedOut: true);
+                        break;
+                    }
                 }
 
-                var remaining = GetRemainingTimeout(deadline);
-                if (remaining <= TimeSpan.Zero || !Monitor.Wait(state.SyncRoot, remaining))
-                {
-                    CompleteCondWaiterLocked(state, waiter, timedOut: true);
-                    break;
-                }
+                _ = (GuestThreadExecution.Scheduler as IGuestExceptionDeliveryScheduler)?
+                    .TryDeliverPendingGuestExceptionForCurrentThread(ctx);
             }
         }
 
