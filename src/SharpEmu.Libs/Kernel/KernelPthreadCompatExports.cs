@@ -1590,6 +1590,14 @@ public static class KernelPthreadCompatExports
                 () => CompleteBlockedCondWait(ctx, condAddress, mutexAddress, state, waiter),
                 () => TryGrantCondWaiterMutex(waiter)))
         {
+            if (TryGrantCondWaiterMutex(waiter))
+            {
+                GuestThreadExecution.TryConsumeCurrentThreadBlock(out _);
+                var immediateResult = CompleteBlockedCondWait(ctx, condAddress, mutexAddress, state, waiter);
+                TracePthreadCond("wait-immediate", condAddress, mutexAddress, state, timed, immediateResult);
+                return immediateResult;
+            }
+
             TracePthreadCond("wait-block", condAddress, mutexAddress, state, timed, (int)OrbisGen2Result.ORBIS_GEN2_OK);
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
@@ -1597,24 +1605,61 @@ public static class KernelPthreadCompatExports
         // Non-guest callers have no resumable CPU continuation. Park only
         // those host-side compatibility callers, preserving the same FIFO
         // mutex reacquisition rules as cooperative guest waiters.
+        var scheduler = GuestThreadExecution.Scheduler;
         lock (state.SyncRoot)
         {
             var deadline = timed
                 ? GuestThreadExecution.ComputeDeadlineTimestamp(GetCondWaitTimeout(timeoutUsec))
                 : long.MaxValue;
+            var spuriousWakeAfter = Stopwatch.GetTimestamp() + Stopwatch.Frequency / 20;
             while (waiter.CompletionState == 0)
             {
+                if (scheduler is not null)
+                {
+                    Monitor.Exit(state.SyncRoot);
+                    try
+                    {
+                        scheduler.Pump(ctx, timed ? "pthread_cond_timedwait" : "pthread_cond_wait");
+                    }
+                    finally
+                    {
+                        Monitor.Enter(state.SyncRoot);
+                    }
+
+                    if (waiter.CompletionState != 0)
+                    {
+                        break;
+                    }
+                }
+
+                if (Stopwatch.GetTimestamp() >= spuriousWakeAfter)
+                {
+                    // POSIX permits pthread_cond_wait to return without a
+                    // matching signal. Use that latitude for the host-side
+                    // fallback so waits driven by guest-side/userspace condition
+                    // state do not become permanent HLE-visible stalls.
+                    CompleteCondWaiterLocked(state, waiter, timedOut: false);
+                    TracePthreadCond("wait-spurious", condAddress, mutexAddress, state, timed, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+                    break;
+                }
+
                 if (!timed)
                 {
-                    Monitor.Wait(state.SyncRoot);
+                    Monitor.Wait(state.SyncRoot, scheduler is null ? Timeout.Infinite : 1);
                     continue;
                 }
 
                 var remaining = GetRemainingTimeout(deadline);
-                if (remaining <= TimeSpan.Zero || !Monitor.Wait(state.SyncRoot, remaining))
+                var waitSlice = scheduler is null
+                    ? remaining
+                    : TimeSpan.FromMilliseconds(Math.Min(1, Math.Max(1, remaining.TotalMilliseconds)));
+                if (remaining <= TimeSpan.Zero || !Monitor.Wait(state.SyncRoot, waitSlice))
                 {
-                    CompleteCondWaiterLocked(state, waiter, timedOut: true);
-                    break;
+                    if (scheduler is null || GetRemainingTimeout(deadline) <= TimeSpan.Zero)
+                    {
+                        CompleteCondWaiterLocked(state, waiter, timedOut: true);
+                        break;
+                    }
                 }
             }
         }

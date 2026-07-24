@@ -23,6 +23,8 @@ public static class KernelSemaphoreCompatExports
         public required int MaxCount { get; init; }
         public int Count { get; set; }
         public int WaitingThreads { get; set; }
+        public ulong CancelEpoch { get; set; }
+        public bool Deleted { get; set; }
         public object Gate { get; } = new();
     }
 
@@ -111,6 +113,7 @@ public static class KernelSemaphoreCompatExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
+        ulong observedCancelEpoch;
         lock (semaphore.Gate)
         {
             if (semaphore.Count >= needCount)
@@ -128,6 +131,7 @@ public static class KernelSemaphoreCompatExports
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
             }
 
+            observedCancelEpoch = semaphore.CancelEpoch;
             semaphore.WaitingThreads++;
         }
 
@@ -135,6 +139,8 @@ public static class KernelSemaphoreCompatExports
         // tokens (so a wake commits the acquisition), while the resume
         // handler distinguishes a real acquisition from a deadline expiry.
         var acquired = false;
+        var canceled = false;
+        var deleted = false;
         var deadline = timeoutAddress != 0
             ? GuestThreadExecution.ComputeDeadlineTimestamp(TimeSpan.FromMicroseconds(timeoutUsec))
             : 0;
@@ -143,6 +149,11 @@ public static class KernelSemaphoreCompatExports
         {
             lock (semaphore.Gate)
             {
+                if (TryFinishInterruptedWaitLocked(semaphore, observedCancelEpoch, out canceled, out deleted))
+                {
+                    return true;
+                }
+
                 if (semaphore.Count >= needCount)
                 {
                     semaphore.Count -= needCount;
@@ -171,6 +182,11 @@ public static class KernelSemaphoreCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
 
+            if (TryReturnInterruptedWait(handle, semaphore, needCount, canceled, deleted, out var result))
+            {
+                return (int)result;
+            }
+
             lock (semaphore.Gate)
             {
                 semaphore.WaitingThreads = Math.Max(0, semaphore.WaitingThreads - 1);
@@ -186,7 +202,7 @@ public static class KernelSemaphoreCompatExports
         if (GuestThreadExecution.RequestCurrentThreadBlock(
                 ctx,
                 "sceKernelWaitSema",
-                GetSemaphoreWakeKey(handle),
+                semaphore.WakeKey,
                 ResumeWait,
                 WakePredicate,
                 deadline))
@@ -199,6 +215,14 @@ public static class KernelSemaphoreCompatExports
             // the count is already sufficient.
             lock (semaphore.Gate)
             {
+                if (TryFinishInterruptedWaitLocked(semaphore, observedCancelEpoch, out canceled, out deleted))
+                {
+                    GuestThreadExecution.TryConsumeCurrentThreadBlock(out _);
+                    return TryReturnInterruptedWait(handle, semaphore, needCount, canceled, deleted, out var interruptedResult)
+                        ? SetReturn(ctx, interruptedResult)
+                        : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+                }
+
                 if (semaphore.Count >= needCount)
                 {
                     semaphore.Count -= needCount;
@@ -221,7 +245,58 @@ public static class KernelSemaphoreCompatExports
 
         // Not a guest thread (or no scheduler): fall back to a host-thread
         // wait so the semantics still hold on non-cooperative callers.
-        return WaitSemaphoreOnHostThread(ctx, semaphore, handle, needCount, timeoutAddress, timeoutUsec);
+        return WaitSemaphoreOnHostThread(ctx, semaphore, handle, needCount, timeoutAddress, timeoutUsec, observedCancelEpoch);
+    }
+
+    private static bool TryFinishInterruptedWaitLocked(
+        KernelSemaphoreState semaphore,
+        ulong observedCancelEpoch,
+        out bool canceled,
+        out bool deleted)
+    {
+        deleted = semaphore.Deleted;
+        canceled = !deleted && semaphore.CancelEpoch != observedCancelEpoch;
+        if (!deleted && !canceled)
+        {
+            return false;
+        }
+
+        semaphore.WaitingThreads = Math.Max(0, semaphore.WaitingThreads - 1);
+        return true;
+    }
+
+    private static bool TryReturnInterruptedWait(
+        uint handle,
+        KernelSemaphoreState semaphore,
+        int needCount,
+        bool canceled,
+        bool deleted,
+        out OrbisGen2Result result)
+    {
+        if (deleted)
+        {
+            if (_traceSema)
+            {
+                TraceSemaphore($"wait-deleted handle=0x{handle:X8} name='{semaphore.Name}' need={needCount}");
+            }
+
+            result = OrbisGen2Result.ORBIS_GEN2_ERROR_DELETED;
+            return true;
+        }
+
+        if (canceled)
+        {
+            if (_traceSema)
+            {
+                TraceSemaphore($"wait-canceled handle=0x{handle:X8} name='{semaphore.Name}' need={needCount}");
+            }
+
+            result = OrbisGen2Result.ORBIS_GEN2_ERROR_CANCELED;
+            return true;
+        }
+
+        result = OrbisGen2Result.ORBIS_GEN2_OK;
+        return false;
     }
 
     private static int WaitSemaphoreOnHostThread(
@@ -230,7 +305,8 @@ public static class KernelSemaphoreCompatExports
         uint handle,
         int needCount,
         ulong timeoutAddress,
-        uint timeoutUsec)
+        uint timeoutUsec,
+        ulong observedCancelEpoch)
     {
         var deadlineMs = timeoutAddress != 0
             ? Environment.TickCount64 + Math.Max(1L, timeoutUsec / 1000L)
@@ -245,6 +321,12 @@ public static class KernelSemaphoreCompatExports
             }
             while (semaphore.Count < needCount)
             {
+                if (TryFinishInterruptedWaitLocked(semaphore, observedCancelEpoch, out var canceled, out var deleted) &&
+                    TryReturnInterruptedWait(handle, semaphore, needCount, canceled, deleted, out var interruptedResult))
+                {
+                    return SetReturn(ctx, interruptedResult);
+                }
+
                 var remaining = deadlineMs - Environment.TickCount64;
                 if (timeoutAddress != 0 && remaining <= 0)
                 {
@@ -375,6 +457,7 @@ public static class KernelSemaphoreCompatExports
             }
 
             semaphore.Count = setCount < 0 ? semaphore.InitialCount : setCount;
+            semaphore.CancelEpoch++;
             semaphore.WaitingThreads = 0;
             Monitor.PulseAll(semaphore.Gate);
             if (_traceSema)
@@ -383,7 +466,7 @@ public static class KernelSemaphoreCompatExports
             }
         }
 
-        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetSemaphoreWakeKey(handle));
+        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(semaphore.WakeKey);
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
@@ -399,6 +482,15 @@ public static class KernelSemaphoreCompatExports
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
         }
+
+        lock (semaphore.Gate)
+        {
+            semaphore.Deleted = true;
+            semaphore.WaitingThreads = 0;
+            Monitor.PulseAll(semaphore.Gate);
+        }
+
+        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(semaphore.WakeKey);
 
         if (_traceSema)
         {
