@@ -235,6 +235,56 @@ public static class AjmExports
     /// consumed with silence produced so the title does not spin on the same
     /// packet.
     /// </summary>
+    // sceAjmBatchJobInitialize(info, instance, codecParams, codecParamsSize, result).
+    // FMOD's AT9 path enqueues this before any decode job; leaving it
+    // unresolved returned a bogus value and left the batch buffer and result
+    // sideband uninitialized, which downstream produced a garbage callback
+    // pointer and a hard crash. Enqueue a well-formed control job and clear
+    // the result sideband to keep the batch consistent.
+    [SysAbiExport(
+        Nid = "ezM2OhNxzck",
+        ExportName = "sceAjmBatchJobInitialize",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAjm")]
+    public static int AjmBatchJobInitialize(CpuContext ctx)
+    {
+        var infoAddress = ctx[CpuRegister.Rdi];
+        var instanceId = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var resultAddress = ctx[CpuRegister.R8];
+
+        if (infoAddress == 0)
+        {
+            return ctx.SetReturn(OrbisAjmErrorInvalidParameter);
+        }
+
+        _ = TryAppendBatchJob(ctx, infoAddress, AjmJobControlSize);
+        WriteControlResult(ctx, resultAddress);
+        Trace($"batch_job_initialize info=0x{infoAddress:X16} instance=0x{instanceId:X8} result=0x{resultAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    // sceAjmBatchJobClearContext(info, instance, result).
+    [SysAbiExport(
+        Nid = "uJ3m8INuikg",
+        ExportName = "sceAjmBatchJobClearContext",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAjm")]
+    public static int AjmBatchJobClearContext(CpuContext ctx)
+    {
+        var infoAddress = ctx[CpuRegister.Rdi];
+        var resultAddress = ctx[CpuRegister.Rdx];
+
+        if (infoAddress == 0)
+        {
+            return ctx.SetReturn(OrbisAjmErrorInvalidParameter);
+        }
+
+        _ = TryAppendBatchJob(ctx, infoAddress, AjmJobControlSize);
+        WriteControlResult(ctx, resultAddress);
+        Trace($"batch_job_clear_context info=0x{infoAddress:X16} result=0x{resultAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
     [SysAbiExport(
         Nid = "39WxhR-ePew",
         ExportName = "sceAjmBatchJobDecode",
@@ -363,9 +413,24 @@ public static class AjmExports
     private const ulong AjmBatchInfoSizeField = 16;
     private const ulong AjmBatchInfoLastGoodJobField = 24;
     private const ulong AjmJobRunSize = 64;
+    private const ulong AjmJobControlSize = 32;
     private const ulong MaxSilentPcmBytes = 1 << 20;
     // AjmSidebandResult (8) + AjmSidebandStream (16) + AjmSidebandMFrame (8).
     private const int DecodeSidebandBytes = 32;
+    // AjmSidebandResult: int result; int internal_result.
+    private const int ControlSidebandBytes = 8;
+
+    private static void WriteControlResult(CpuContext ctx, ulong resultAddress)
+    {
+        if (resultAddress == 0)
+        {
+            return;
+        }
+
+        Span<byte> sideband = stackalloc byte[ControlSidebandBytes];
+        sideband.Clear();
+        _ = ctx.Memory.TryWrite(resultAddress, sideband);
+    }
 
     private static bool TryAppendBatchJob(CpuContext ctx, ulong infoAddress, ulong jobSize)
     {
