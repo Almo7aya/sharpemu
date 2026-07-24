@@ -26,6 +26,8 @@ public static class KernelRuntimeCompatExports
     private const int MallocReplaceSize = 0x70;
     private const int NewReplaceSize = 0x68;
     private const int OrbisTimesecSize = sizeof(long) + sizeof(uint) + sizeof(uint);
+    private const long MinUnixTimeSeconds = -62135596800L;
+    private const long MaxUnixTimeSeconds = 253402300799L;
     // PS4/PS5 libkernel module-info ABI. The extended form is consumed by
     // sceKernelGetModuleInfoFromAddr and ends at byte 0x1A8; libc commonly
     // places its stack canary immediately after that caller-owned buffer.
@@ -1345,6 +1347,11 @@ public static class KernelRuntimeCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        if (!IsValidUnixTimeSeconds(utcSeconds))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
         var utc = DateTimeOffset.FromUnixTimeSeconds(utcSeconds);
         var local = TimeZoneInfo.ConvertTime(utc, TimeZoneInfo.Local);
         var offset = local.Offset;
@@ -1392,11 +1399,16 @@ public static class KernelRuntimeCompatExports
     public static int KernelConvertLocaltimeToUtc(CpuContext ctx)
     {
         var localSeconds = unchecked((long)ctx[CpuRegister.Rdi]);
-        var utcTimeAddress = ctx[CpuRegister.Rdx];
-        var timezoneAddress = ctx[CpuRegister.Rcx];
-        var dstSecondsAddress = ctx[CpuRegister.R8];
+        var utcTimeAddress = ctx[CpuRegister.Rsi];
+        var timezoneAddress = ctx[CpuRegister.Rdx];
+        var dstSecondsAddress = ctx[CpuRegister.Rcx];
 
         if (timezoneAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!IsValidUnixTimeSeconds(localSeconds))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
@@ -1432,6 +1444,9 @@ public static class KernelRuntimeCompatExports
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    private static bool IsValidUnixTimeSeconds(long seconds) =>
+        seconds >= MinUnixTimeSeconds && seconds <= MaxUnixTimeSeconds;
 
     [SysAbiExport(
         Nid = "vYU8P9Td2Zo",
