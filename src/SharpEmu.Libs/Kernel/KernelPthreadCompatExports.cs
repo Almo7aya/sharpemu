@@ -15,6 +15,9 @@ public static class KernelPthreadCompatExports
     private const int MutexTypeErrorCheck = 1;
     private const int MutexTypeRecursive = 2;
     private const int MutexTypeNormal = 3;
+    // Host-parked pthread_cond_wait wait slice: short enough to pump the
+    // scheduler promptly, long enough to avoid a busy spin.
+    private const int HostCondWaitSliceMilliseconds = 1;
     private const int MutexTypeAdaptiveNp = 4;
     private const ulong StaticAdaptiveMutexInitializer = 1;
     private const int MutexObjectSize = 0x100;
@@ -1594,29 +1597,59 @@ public static class KernelPthreadCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        // Non-guest callers have no resumable CPU continuation. Park only
-        // those host-side compatibility callers, preserving the same FIFO
-        // mutex reacquisition rules as cooperative guest waiters.
-        lock (state.SyncRoot)
+        // Non-guest callers have no resumable CPU continuation, so they park
+        // here instead of yielding to the scheduler. Two boot-critical
+        // properties beyond a plain Monitor.Wait:
+        //
+        //  * Pump the scheduler between short wait slices. Whoever will signal
+        //    this condition is very often a cooperative guest thread the
+        //    scheduler must run; a bare wait on this host thread would never
+        //    give it a turn (classic self-deadlock at startup).
+        //
+        //  * After a short grace period with no completion, wake spuriously.
+        //    POSIX explicitly permits pthread_cond_wait to return without a
+        //    matching signal, and the guest re-tests its predicate on return.
+        //    This is what breaks IL2CPP's stop-the-world handshake: the GC
+        //    suspends a thread parked in a condition wait by raising a kernel
+        //    exception queued for its next import boundary, and a permanently
+        //    parked host waiter never reaches one. Returning spuriously sends
+        //    it back through the import boundary, the queued suspend handler
+        //    runs and acknowledges, and the collector proceeds.
+        var scheduler = GuestThreadExecution.Scheduler;
+        var deadline = timed
+            ? GuestThreadExecution.ComputeDeadlineTimestamp(GetCondWaitTimeout(timeoutUsec))
+            : long.MaxValue;
+        var spuriousWakeAt = Stopwatch.GetTimestamp() + Stopwatch.Frequency / 20;
+        while (true)
         {
-            var deadline = timed
-                ? GuestThreadExecution.ComputeDeadlineTimestamp(GetCondWaitTimeout(timeoutUsec))
-                : long.MaxValue;
-            while (waiter.CompletionState == 0)
+            lock (state.SyncRoot)
             {
-                if (!timed)
+                if (waiter.CompletionState != 0)
                 {
-                    Monitor.Wait(state.SyncRoot);
-                    continue;
+                    break;
                 }
 
-                var remaining = GetRemainingTimeout(deadline);
-                if (remaining <= TimeSpan.Zero || !Monitor.Wait(state.SyncRoot, remaining))
+                if (timed && GetRemainingTimeout(deadline) <= TimeSpan.Zero)
                 {
                     CompleteCondWaiterLocked(state, waiter, timedOut: true);
                     break;
                 }
+
+                if (Stopwatch.GetTimestamp() >= spuriousWakeAt)
+                {
+                    CompleteCondWaiterLocked(state, waiter, timedOut: false);
+                    TracePthreadCond("wait-spurious", condAddress, mutexAddress, state, timed, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+                    break;
+                }
+
+                Monitor.Wait(state.SyncRoot, HostCondWaitSliceMilliseconds);
+                if (waiter.CompletionState != 0)
+                {
+                    break;
+                }
             }
+
+            scheduler?.Pump(ctx, timed ? "pthread_cond_timedwait" : "pthread_cond_wait");
         }
 
         if (waiter.MutexWaiter is null)
