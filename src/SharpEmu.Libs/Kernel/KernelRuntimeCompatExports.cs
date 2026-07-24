@@ -1388,9 +1388,9 @@ public static class KernelRuntimeCompatExports
         var offset = _localTimeZone.GetUtcOffset(utc);
         var localSeconds = utcSeconds + (long)offset.TotalSeconds;
         var dstSeconds = (uint)GetDstSeconds(offset);
-        // Seconds west of UTC excluding DST (FreeBSD timezone convention),
-        // consistent with sceKernelConvertLocaltimeToUtc's minuteswest.
-        var westSeconds = unchecked((uint)(int)-(offset.TotalSeconds - dstSeconds));
+        // SceKernelTimesec.west_sec holds the negated minuteswest (the
+        // standard offset in seconds, positive east of UTC).
+        var westSeconds = unchecked((uint)(int)(offset.TotalSeconds - dstSeconds));
 
         if (!ctx.TryWriteUInt64(localTimeAddress, unchecked((ulong)localSeconds)))
         {
@@ -1439,12 +1439,12 @@ public static class KernelRuntimeCompatExports
         var offset = _localTimeZone.GetUtcOffset(localDate);
         var utcSeconds = localSeconds - (long)offset.TotalSeconds;
         var dstSeconds = GetDstSeconds(offset);
-        // Minutes west of UTC excluding DST (FreeBSD timezone convention),
-        // consistent with sceKernelConvertUtcToLocaltime's west field.
+        // Minutes west of UTC excluding DST (FreeBSD timezone convention);
+        // tz_dsttime is a DST-observed flag, not an amount.
         var minutesWest = unchecked((int)-(offset.TotalSeconds - dstSeconds) / 60);
 
         if (!TryWriteInt32(ctx, timezoneAddress, minutesWest) ||
-            !TryWriteInt32(ctx, timezoneAddress + sizeof(int), dstSeconds / 60))
+            !TryWriteInt32(ctx, timezoneAddress + sizeof(int), dstSeconds > 0 ? 1 : 0))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }

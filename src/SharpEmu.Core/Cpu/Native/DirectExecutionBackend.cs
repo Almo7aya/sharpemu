@@ -1423,7 +1423,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				0xC3,                                           // 57: ret
 			};
 			BinaryPrimitives.WriteInt32LittleEndian(code.AsSpan(8), offsetSeconds);
-			BinaryPrimitives.WriteInt32LittleEndian(code.AsSpan(26), -offsetSeconds);
+			// SceKernelTimesec.west_sec: the negated minuteswest (positive
+			// seconds east of UTC).
+			BinaryPrimitives.WriteInt32LittleEndian(code.AsSpan(26), offsetSeconds);
 			return code;
 		}
 
