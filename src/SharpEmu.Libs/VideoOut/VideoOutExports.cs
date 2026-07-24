@@ -198,6 +198,7 @@ public static class VideoOutExports
         public ulong VblankCount { get; set; }
         public ulong FlipCount { get; set; }
         public int CurrentBuffer { get; set; } = -1;
+        public ulong LastFlipArg { get; set; }
         public uint OutputWidth { get; set; } = 1920;
         public uint OutputHeight { get; set; } = 1080;
         public uint RefreshRate { get; set; } = 60;
@@ -710,16 +711,18 @@ public static class VideoOutExports
 
         ulong count;
         uint currentBuffer;
+        ulong flipArg;
         lock (_stateGate)
         {
             count = port.FlipCount;
             currentBuffer = unchecked((uint)port.CurrentBuffer);
+            flipArg = port.LastFlipArg;
         }
 
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x00, count);
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x08, 0);
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x10, 0);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x18, 0);
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x18, flipArg);
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x20, currentBuffer);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1159,6 +1162,7 @@ public static class VideoOutExports
 
             port.CurrentBuffer = bufferIndex;
             port.FlipCount++;
+            port.LastFlipArg = unchecked((ulong)flipArg);
             eventHint = SceVideoOutInternalEventFlip |
                 ((unchecked((ulong)flipArg) & 0x0000_FFFF_FFFF_FFFFUL) << 16);
             flipEventCount = port.FlipEvents.Count;
