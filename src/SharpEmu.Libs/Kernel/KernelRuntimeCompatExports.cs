@@ -1363,18 +1363,16 @@ public static class KernelRuntimeCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        // These conversions are on IL2CPP's time/date hot path, so the DST
+        // amount comes from the base-offset delta instead of a per-call
+        // adjustment-rule scan.
         var utc = DateTimeOffset.FromUnixTimeSeconds(utcSeconds);
-        var local = TimeZoneInfo.ConvertTime(utc, TimeZoneInfo.Local);
-        var offset = local.Offset;
+        var offset = TimeZoneInfo.Local.GetUtcOffset(utc);
         var localSeconds = utcSeconds + (long)offset.TotalSeconds;
-        var dstSeconds = TimeZoneInfo.Local.IsDaylightSavingTime(local.DateTime)
-            ? (uint)Math.Max(0, TimeZoneInfo.Local.GetAdjustmentRules()
-                .Where(rule => rule.DateStart <= local.Date && rule.DateEnd >= local.Date)
-                .Select(rule => rule.DaylightDelta.TotalSeconds)
-                .DefaultIfEmpty(0)
-                .Max())
-            : 0u;
-        var westSeconds = unchecked((uint)(int)offset.TotalSeconds);
+        var dstSeconds = (uint)GetDstSeconds(offset);
+        // SceKernelTimesec.west_sec holds the negated minuteswest (the
+        // standard offset in seconds, positive east of UTC).
+        var westSeconds = unchecked((uint)(int)(offset.TotalSeconds - dstSeconds));
 
         if (!ctx.TryWriteUInt64(localTimeAddress, unchecked((ulong)localSeconds)))
         {
@@ -1427,17 +1425,13 @@ public static class KernelRuntimeCompatExports
         var localDate = DateTimeOffset.FromUnixTimeSeconds(localSeconds).DateTime;
         var offset = TimeZoneInfo.Local.GetUtcOffset(localDate);
         var utcSeconds = localSeconds - (long)offset.TotalSeconds;
-        var dstSeconds = TimeZoneInfo.Local.IsDaylightSavingTime(localDate)
-            ? (int)Math.Max(0, TimeZoneInfo.Local.GetAdjustmentRules()
-                .Where(rule => rule.DateStart <= localDate.Date && rule.DateEnd >= localDate.Date)
-                .Select(rule => rule.DaylightDelta.TotalSeconds)
-                .DefaultIfEmpty(0)
-                .Max())
-            : 0;
-        var minutesWest = unchecked((int)-offset.TotalMinutes);
+        var dstSeconds = GetDstSeconds(offset);
+        // Minutes west of UTC excluding DST (FreeBSD timezone convention);
+        // tz_dsttime is a DST-observed flag, not an amount.
+        var minutesWest = unchecked((int)-(offset.TotalSeconds - dstSeconds) / 60);
 
         if (!TryWriteInt32(ctx, timezoneAddress, minutesWest) ||
-            !TryWriteInt32(ctx, timezoneAddress + sizeof(int), dstSeconds / 60))
+            !TryWriteInt32(ctx, timezoneAddress + sizeof(int), dstSeconds > 0 ? 1 : 0))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
@@ -1454,6 +1448,15 @@ public static class KernelRuntimeCompatExports
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // The DST delta is the difference between the effective offset and the
+    // zone's standard offset, matching what a rule scan computes while
+    // costing one lookup.
+    private static int GetDstSeconds(TimeSpan effectiveOffset)
+    {
+        var delta = effectiveOffset - TimeZoneInfo.Local.BaseUtcOffset;
+        return delta > TimeSpan.Zero ? (int)delta.TotalSeconds : 0;
     }
 
     private static bool IsValidUnixTimeSeconds(long seconds) =>
