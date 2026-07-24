@@ -114,6 +114,28 @@ public static class GuestTlsTemplate
         get { lock (_gate) { return _generation; } }
     }
 
+    // The current generation mirrored into unmanaged memory so a native
+    // __tls_get_addr fast path can compare it against a thread's DTV header
+    // without entering managed code. Written under _gate; a racing native
+    // reader that sees the old value takes the managed slow path, which is
+    // always correct.
+    private static readonly nint _generationCell = AllocateGenerationCell();
+
+    /// <summary>Address of an unmanaged u64 holding the current generation.</summary>
+    public static nint GenerationCellAddress => _generationCell;
+
+    private static nint AllocateGenerationCell()
+    {
+        var cell = Marshal.AllocHGlobal(sizeof(ulong));
+        Marshal.WriteInt64(cell, 0);
+        return cell;
+    }
+
+    private static void PublishGeneration()
+    {
+        Marshal.WriteInt64(_generationCell, unchecked((long)_generation));
+    }
+
     /// <summary>
     /// Backwards-compatible main-module registration entry point.
     /// </summary>
@@ -189,6 +211,7 @@ public static class GuestTlsTemplate
             _staticTlsSize = staticOffset;
             _maximumAlignment = Math.Max(_maximumAlignment, normalizedAlignment);
             _generation++;
+            PublishGeneration();
             return staticOffset;
         }
     }
@@ -224,6 +247,7 @@ public static class GuestTlsTemplate
             _staticTlsSize = 0;
             _maximumAlignment = 1;
             _generation++;
+            PublishGeneration();
         }
     }
 

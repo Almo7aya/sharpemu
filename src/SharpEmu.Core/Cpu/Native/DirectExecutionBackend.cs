@@ -1200,6 +1200,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		GuestThreadExecution.Scheduler = this;
 		try
 		{
+			// The __tls_get_addr import intrinsic embeds the TLS handler's
+			// address, so the handler must exist before the stubs are built.
+			CreateTlsHandler();
 			if (!SetupImportStubs(importStubs))
 			{
 				if (string.IsNullOrEmpty(LastError))
@@ -1209,7 +1212,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				result = OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
 				return false;
 			}
-			CreateTlsHandler();
 			PatchTlsPatterns();
 			return ExecuteEntry(context, entryPoint, out result);
 		}
@@ -1302,6 +1304,26 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				num++;
 				continue;
 			}
+			if (string.Equals(text2, "vNe1w4diLCs", StringComparison.Ordinal))
+			{
+				// __tls_get_addr is on IL2CPP's hottest paths (tens of millions
+				// of calls during startup); serve the common DTV hit natively
+				// and fall back to the managed handler for misses/rebuilds.
+				var tlsFallback = CreateImportHandlerTrampoline(num);
+				if (tlsFallback != 0 &&
+					TryCreateTlsGetAddrIntrinsic(tlsFallback, out var tlsIntrinsic))
+				{
+					if (!PatchImportStub((nint)(long)num4, tlsIntrinsic))
+					{
+						LastError = $"Failed to patch __tls_get_addr intrinsic stub at 0x{num4:X16}";
+						return false;
+					}
+					Console.Error.WriteLine("[LOADER][INFO] Native __tls_get_addr fast path enabled.");
+					num2++;
+					num++;
+					continue;
+				}
+			}
 			nint num5 = CreateImportHandlerTrampoline(num);
 			if (num5 == 0)
 			{
@@ -1322,6 +1344,75 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		Console.Error.WriteLine($"[LOADER][INFO] Setup {num2}/{importStubs.Count} import stubs (direct bridge, lle_redirects={num3})");
 		return num2 == importStubs.Count;
+	}
+
+	/// <summary>
+	/// Emits the standard DTV fast path for <c>__tls_get_addr(tls_index*)</c>:
+	/// obtain the guest thread pointer from the TLS handler (the host fs
+	/// register belongs to the .NET runtime, so it cannot be read directly),
+	/// validate the DTV generation against the unmanaged mirror
+	/// <see cref="GuestTlsTemplate.GenerationCellAddress"/>, index the module
+	/// slot, and add the offset. Any miss (no DTV yet, stale generation,
+	/// unknown/late module) tail-calls the managed handler, which performs
+	/// the rebuild.
+	/// </summary>
+	private unsafe bool TryCreateTlsGetAddrIntrinsic(nint fallback, out nint address)
+	{
+		address = 0;
+		var generationCell = GuestTlsTemplate.GenerationCellAddress;
+		var tlsHandler = _tlsHandlerAddress;
+		if (generationCell == 0 || fallback == 0 || tlsHandler == 0)
+		{
+			return false;
+		}
+
+		var code = new byte[]
+		{
+			0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,                   //  0: movabs rax, TLSHANDLER (imm64 @2)
+			0xFF, 0xD0,                                           // 10: call rax             (rax = guest tp)
+			0x48, 0x8B, 0x40, 0x08,                               // 12: mov rax,[rax+8]      (dtv)
+			0x48, 0x85, 0xC0,                                     // 16: test rax,rax
+			0x74, 0x2F,                                           // 19: jz slow
+			0x48, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0,                   // 21: movabs rcx, GENCELL  (imm64 @23)
+			0x48, 0x8B, 0x09,                                     // 31: mov rcx,[rcx]
+			0x48, 0x3B, 0x08,                                     // 34: cmp rcx,[rax]        (dtv generation)
+			0x75, 0x1D,                                           // 37: jne slow
+			0x48, 0x8B, 0x0F,                                     // 39: mov rcx,[rdi]        (moduleId)
+			0x48, 0x85, 0xC9,                                     // 42: test rcx,rcx
+			0x74, 0x15,                                           // 45: jz slow
+			0x48, 0x3B, 0x48, 0x08,                               // 47: cmp rcx,[rax+8]      (max moduleId)
+			0x77, 0x0F,                                           // 51: ja slow
+			0x48, 0x8B, 0x44, 0xC8, 0x08,                         // 53: mov rax,[rax+rcx*8+8]
+			0x48, 0x85, 0xC0,                                     // 58: test rax,rax
+			0x74, 0x05,                                           // 61: jz slow
+			0x48, 0x03, 0x47, 0x08,                               // 63: add rax,[rdi+8]      (+offset)
+			0xC3,                                                 // 67: ret
+			0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,                   // 68: movabs rax, FALLBACK (imm64 @70)
+			0xFF, 0xE0,                                           // 78: jmp rax
+		};
+		BinaryPrimitives.WriteInt64LittleEndian(code.AsSpan(2), tlsHandler);
+		BinaryPrimitives.WriteInt64LittleEndian(code.AsSpan(23), generationCell);
+		BinaryPrimitives.WriteInt64LittleEndian(code.AsSpan(70), fallback);
+
+		const uint allocationSize = 128u;
+		void* memory = VirtualAlloc(null, allocationSize, 12288u, 64u);
+		if (memory == null)
+		{
+			return false;
+		}
+
+		code.CopyTo(new Span<byte>(memory, code.Length));
+		uint oldProtect = 0;
+		if (!VirtualProtect(memory, allocationSize, 32u, &oldProtect))
+		{
+			VirtualFree(memory, 0u, 32768u);
+			return false;
+		}
+
+		FlushInstructionCache(GetCurrentProcess(), memory, (nuint)code.Length);
+		address = (nint)memory;
+		_importHandlerTrampolines.Add(address);
+		return true;
 	}
 
 	private unsafe bool TryCreateNativeImportIntrinsic(string nid, out nint address)
@@ -2301,6 +2392,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private unsafe void CreateTlsHandler()
 	{
+		if (_tlsHandlerAddress != 0)
+		{
+			return;
+		}
+
 		_tlsHandlerAddress = (nint)TryAllocateNearEntry(TlsHandlerRegionSize);
 		if (_tlsHandlerAddress == 0)
 		{
