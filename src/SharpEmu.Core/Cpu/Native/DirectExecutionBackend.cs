@@ -771,6 +771,23 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private static readonly nint ImportGatewayPtr = ResolveWin64CallbackPtr(
 		Marshal.GetFunctionPointerForDelegate(ImportGatewayDelegateInstance));
 
+	// Managed callback entry points a corrupted guest pointer could land on.
+	// Resuming a guest continuation into any of these hits a runtime
+	// fail-fast, so IsResumableGuestRip rejects them; see that method.
+	private static readonly HashSet<ulong> _managedCallbackGuardAddresses = BuildManagedCallbackGuard();
+
+	private static unsafe HashSet<ulong> BuildManagedCallbackGuard()
+	{
+		var guard = new HashSet<ulong>
+		{
+			unchecked((ulong)(long)ImportGatewayPtr),
+			unchecked((ulong)(long)Marshal.GetFunctionPointerForDelegate(ImportGatewayDelegateInstance)),
+			unchecked((ulong)(long)(delegate* unmanaged<int, nint, nint, void>)&HandlePosixSignal),
+		};
+		guard.Remove(0);
+		return guard;
+	}
+
 	// Emitted trampolines call managed callbacks with the Win64 ABI. On
 	// Windows the runtime already compiles them that way; on POSIX .NET they
 	// are SysV, so route through a Win64->SysV thunk.
@@ -5670,6 +5687,22 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			GuestThreadExecution.CurrentGuestThreadHandle,
 			continuation,
 			name);
+		// A guest that ran off the rails (e.g. an under-implemented import
+		// leaving a callback table half-initialized) can present a resume RIP
+		// that points at emulator-owned managed code. Transferring there hits
+		// a runtime fail-fast ("UnmanagedCallersOnly method from managed
+		// code") that aborts the whole process. Fault just this thread
+		// instead, leaving the rest of the guest running and the failure
+		// diagnosable.
+		if (!IsResumableGuestRip(continuation.Rip))
+		{
+			reason = $"guest continuation resume address 0x{continuation.Rip:X16} is not executable guest code";
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Refusing to resume '{name}' at non-guest RIP 0x{continuation.Rip:X16} " +
+				$"(rsp=0x{continuation.Rsp:X16}); faulting thread instead of aborting.");
+			return GuestNativeCallExitReason.Exception;
+		}
+
 		ApplyGuestContinuation(context, continuation);
 		return ExecuteGuestContinuationEntry(
 			context,
@@ -5677,6 +5710,43 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			continuation.ReturnSlotAddress,
 			name,
 			out reason);
+	}
+
+	/// <summary>
+	/// A resumed continuation RIP must point at committed, executable memory
+	/// that is not the emulator's own managed callback code. The managed
+	/// callback addresses the backend hands to guest-facing trampolines are
+	/// the ones a corrupted guest pointer realistically lands on, and jumping
+	/// to them fail-fasts the process; reject those explicitly, and require an
+	/// executable page for everything else.
+	/// </summary>
+	private unsafe bool IsResumableGuestRip(ulong rip)
+	{
+		if (rip < 0x10000)
+		{
+			return false;
+		}
+
+		if (_managedCallbackGuardAddresses.Contains(rip))
+		{
+			return false;
+		}
+
+		if (VirtualQuery((void*)rip, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+		{
+			return false;
+		}
+
+		if (mbi.State != MEM_COMMIT)
+		{
+			return false;
+		}
+
+		var protect = mbi.Protect & 0xFF;
+		return protect == PAGE_EXECUTE ||
+			protect == PAGE_EXECUTE_READ ||
+			protect == PAGE_EXECUTE_READWRITE ||
+			protect == PAGE_EXECUTE_WRITECOPY;
 	}
 
 	private static void TraceFocusedContinuation(
