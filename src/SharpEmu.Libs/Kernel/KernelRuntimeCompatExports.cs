@@ -984,6 +984,27 @@ public static class KernelRuntimeCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // libSceSysmodule forwards its unwind lookup straight to the kernel
+    // implementation; IL2CPP's C++ exception unwinder calls this alias, and
+    // an unresolved result there breaks every managed throw mid-unwind.
+    [SysAbiExport(
+        Nid = "4fU5yvOkVG4",
+        ExportName = "sceSysmoduleGetModuleInfoForUnwind",
+        Target = Generation.Gen5,
+        LibraryName = "libSceSysmodule")]
+    public static int SysmoduleGetModuleInfoForUnwind(CpuContext ctx) =>
+        KernelGetModuleInfoForUnwind(ctx);
+
+    // Internal Gen5 unwind-info lookup observed alongside RpQJJVKTiFM; the
+    // guest's unwinder queries it first with the same argument layout.
+    [SysAbiExport(
+        Nid = "crb5j7mkk1c",
+        ExportName = "sceKernelUnknownCrb5j7mkk1c",
+        Target = Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelGetModuleInfoForUnwindGen5(CpuContext ctx) =>
+        KernelGetModuleInfoForUnwind(ctx);
+
     [SysAbiExport(
         Nid = "RpQJJVKTiFM",
         ExportName = "sceKernelGetModuleInfoForUnwind",
@@ -1016,7 +1037,18 @@ public static class KernelRuntimeCompatExports
 
         if (!KernelModuleRegistry.TryGetModuleByAddress(queriedAddress, out var module))
         {
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+            // A guest unwind can walk into emulator-generated code (import
+            // trampolines, guest-callback bridges). Reporting a synthetic
+            // boundary with no unwind tables lets libc's unwinder stop
+            // cleanly instead of aborting the throw mid-flight, which
+            // strands any load that relies on catching exceptions.
+            if (!TryWriteHostBoundaryInfoForUnwind(ctx, outInfoAddress, queriedAddress))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
         if (!TryWriteModuleInfoForUnwind(ctx, outInfoAddress, module))
@@ -1026,6 +1058,20 @@ public static class KernelRuntimeCompatExports
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static bool TryWriteHostBoundaryInfoForUnwind(
+        CpuContext ctx,
+        ulong outInfoAddress,
+        ulong queriedAddress)
+    {
+        const int unwindInfoSize = 0x130;
+        var payload = new byte[unwindInfoSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(payload, unwindInfoSize);
+        WriteModuleName(payload, "SharpEmuHostBoundary");
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(0x120), queriedAddress & ~0xFFFFFUL);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(0x128), 0x100000);
+        return ctx.Memory.TryWrite(outInfoAddress, payload);
     }
 
     [SysAbiExport(

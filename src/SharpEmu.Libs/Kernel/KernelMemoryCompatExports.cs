@@ -1893,6 +1893,14 @@ public static partial class KernelMemoryCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // Gen5 unlink alias observed alongside AUXVxWeJU-A.
+    [SysAbiExport(
+        Nid = "VAzswvTOCzI",
+        ExportName = "sceKernelUnlinkGen5",
+        Target = Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelUnlinkGen5(CpuContext ctx) => KernelUnlink(ctx);
+
     [SysAbiExport(
         Nid = "AUXVxWeJU-A",
         ExportName = "sceKernelUnlink",

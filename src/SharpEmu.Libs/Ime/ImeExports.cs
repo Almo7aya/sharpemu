@@ -43,4 +43,18 @@ public static class ImeExports
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    // Success no-op without an output payload, matching known-good emulator
+    // behavior; callers probe keyboards during input bootstrap and tolerate
+    // the empty answer.
+    [SysAbiExport(
+        Nid = "VkqLPArfFdc",
+        ExportName = "sceImeKeyboardGetInfo",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceIme")]
+    public static int ImeKeyboardGetInfo(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
 }
