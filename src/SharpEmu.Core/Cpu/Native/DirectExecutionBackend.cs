@@ -6843,6 +6843,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			ulong rsp = cpuContext[CpuRegister.Rsp];
 			Console.Error.WriteLine($"[LOADER][ERROR] Stall snapshot: rip=0x{cpuContext.Rip:X16} rsp=0x{rsp:X16} rbp=0x{cpuContext[CpuRegister.Rbp]:X16} rax=0x{cpuContext[CpuRegister.Rax]:X16} rbx=0x{cpuContext[CpuRegister.Rbx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} rdi=0x{cpuContext[CpuRegister.Rdi]:X16}");
+			Console.Error.WriteLine($"[LOADER][ERROR] Stall snapshot regs2: r8=0x{cpuContext[CpuRegister.R8]:X16} r9=0x{cpuContext[CpuRegister.R9]:X16} r10=0x{cpuContext[CpuRegister.R10]:X16} r11=0x{cpuContext[CpuRegister.R11]:X16} r12=0x{cpuContext[CpuRegister.R12]:X16} r13=0x{cpuContext[CpuRegister.R13]:X16} r14=0x{cpuContext[CpuRegister.R14]:X16} r15=0x{cpuContext[CpuRegister.R15]:X16}");
 			ulong num = cpuContext.Rip & 0xFFFFFFFFFFFFFFF0uL;
 			for (int i = 0; i < _importEntries.Length; i++)
 			{
